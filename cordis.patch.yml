@@ -1,0 +1,3 @@
+- insert:
+    - id: sim
+      name: dsh-plugin-sim

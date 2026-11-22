@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tgz
+*.bundle
+dsh-plugin-sim-*-release.zip
+*.tsbuildinfo
+.sim/
