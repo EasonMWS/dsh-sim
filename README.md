@@ -10,7 +10,7 @@
 dsh plugin --profile web add /absolute/path/dsh-plugin-sim-0.2.0.tgz
 ```
 
-源码检出可先执行 `npm ci && npm run build`，再把绝对目录传给同一条 `add` 命令。该插件的运行时仅使用 Node.js 标准库和宿主已提供的钩子。Node.js 22.18+。集成测试覆盖 Harness `0.2.1-rc.3` 和 `0.2.2-rc.5` 的 Cordis、工具执行和会话 API。[Harness 安装文档](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish.html)
+源码检出可先执行 `npm ci && npm run build`，再把绝对目录传给同一条 `add` 命令。该插件的运行时仅使用 Node.js 标准库和宿主已提供的钩子。Node.js 22.18+。要求 Harness `>=0.2.1-rc.3 <0.3.0`（含预发布版本）。集成测试覆盖 `0.2.1-rc.3` 和 `0.2.2-rc.5` 的 Cordis、工具执行和会话 API。[Harness 安装文档](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish.html)
 
 ## 一个例子
 

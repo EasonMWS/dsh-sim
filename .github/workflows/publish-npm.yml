@@ -1,0 +1,44 @@
+name: publish-npm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: publish to npm via trusted publishing
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:integration
+      - name: Diagnostics
+        run: |
+          node --version
+          npm --version
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then echo "OIDC env present"; else echo "OIDC env MISSING"; fi
+          if [ -f "$HOME/.npmrc" ]; then echo "user npmrc exists"; else echo "no user npmrc"; fi
+      - name: Publish
+        env:
+          NPM_CONFIG_LOGLEVEL: verbose
+        # A prerelease needs an explicit dist-tag: npm 11 refuses to publish one without it, and older
+        # npm would silently make it `latest` — pushing a beta to everyone reading /latest. The tag is
+        # derived from the version so a stable release still lands on latest.
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          case "$VERSION" in
+            *-*) TAG="$(node -p "require('./package.json').version.split('-')[1].split('.')[0]")" ;;
+            *)   TAG="latest" ;;
+          esac
+          echo "publishing $VERSION with dist-tag $TAG"
+          npm publish --provenance --access public --registry https://registry.npmjs.org --tag "$TAG"

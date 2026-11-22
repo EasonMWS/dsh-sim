@@ -1,29 +1,54 @@
 {
   "name": "dsh-plugin-sim",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local failure-to-fix memory for DeepSeek Harness",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/EasonMWS/dsh-sim.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EasonMWS/dsh-sim.git"
+  },
   "homepage": "https://github.com/EasonMWS/dsh-sim#readme",
   "bugs": "https://github.com/EasonMWS/dsh-sim/issues",
   "type": "module",
-  "engines": { "node": ">=22.18", "dsh": "0.2.1-rc.3 || 0.2.2-rc.5 || >=0.2.1 <0.3.0" },
+  "engines": {
+    "node": ">=22.18",
+    "dsh": ">=0.2.1-rc.3 <0.3.0-0"
+  },
   "exports": {
     ".": "./dist/dsh-adapter.js",
     "./core": "./dist/engine.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["dist", "src", "cordis.patch.yml", "locale", "icon.svg", "README.md", "LICENSE"],
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "files": [
+    "dist",
+    "src",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.ts",
     "test:integration": "npm run build && node --test test/harness.integration.ts",
     "prepack": "npm run build"
   },
-  "peerDependencies": { "@deepseek-ai/cordis": ">=4.0.5 <5" },
-  "peerDependenciesMeta": { "@deepseek-ai/cordis": { "optional": true } },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5 <5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.1-rc.3",
@@ -35,5 +60,23 @@
     "@types/node": "26.6.6",
     "typescript": "5.9.3"
   },
-  "keywords": ["deepseek-harness", "cordis", "dsh", "sim"]
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "dsh-plugin",
+    "memory",
+    "failure-memory",
+    "retry",
+    "self-improvement",
+    "agent-memory",
+    "工具",
+    "插件",
+    "记忆",
+    "防复发"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }
