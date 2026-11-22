@@ -5,6 +5,7 @@ import { fingerprint, similarity } from '../src/fingerprint.ts';
 import { COLD_AFTER, memoryLedger } from '../src/ledger.ts';
 import { makeRecipe } from '../src/recipes.ts';
 import type { Outcome, ToolCall } from '../src/types.ts';
+import { wrapHint } from '../src/surface.ts';
 
 const failure: Outcome = { kind: 'failure', code: 'SHELL_EXIT', diagnostic: 'ERR_PNPM_USAGE Cannot execute package script with the current package manager' };
 const success: Outcome = { kind: 'success' };
@@ -31,10 +32,24 @@ function setup() {
 test('normalization strips timestamps, ANSI, drive and POSIX roots, lines, UUIDs and addresses', () => {
   const a = '2026-11-22T10:30:59.512Z \u001b[31mTS2322 Cannot assign module type at C:\\Checkout\\temp\\config.ts:12:33 0x90da 123e4567-e89b-12d3-a456-426614174000\u001b[0m';
   const b = '2026-12-10T09:00:32Z TS2322 Cannot assign module type at /home/other/project/config.ts:54:88 0x4401 773e4567-e89b-12d3-a456-426614174999';
-  assert.equal(fingerprint(a, 'shell')?.hash, fingerprint(b, 'shell')?.hash);
+  assert.equal(fingerprint(a, 'shell', 'C:\\Checkout\\temp')?.hash, fingerprint(b, 'shell', '/home/other/project')?.hash);
   assert.notEqual(fingerprint(a, 'shell')?.hash, fingerprint(b.replace('TS2322', 'TS2307'), 'shell')?.hash);
   assert.notEqual(fingerprint(a, 'shell')?.hash, fingerprint(b, 'args')?.hash);
   assert.equal(fingerprint('Error: command failed'), undefined);
+});
+
+test('fingerprints strip PID and Chinese locations, keep hex words, and distinguish same-named files', () => {
+  const a = fingerprint('Error: TS2307 pid=87654 找不到模块 第 17 行 第 3 列 "C:\\My Repo\\utils\\helper.ts" build a1b2c3d', 'SHELL_EXIT', 'C:\\My Repo');
+  const b = fingerprint('Error: TS2307 pid 345 找不到模块 第9行 第47列 ./utils/helper.ts build c1d2e3f', 'SHELL_EXIT', '/repo');
+  assert.ok(a && b);
+  assert.equal(a.hash, b.hash);
+  assert.notEqual(fingerprint('Error: failed to parse acceded template')?.hash, fingerprint('Error: failed to parse defaced template')?.hash);
+  const api = fingerprint('TS2307 Cannot resolve internal workspace module during validation at /repo/packages/api/index.ts');
+  const web = fingerprint('TS2307 Cannot resolve internal workspace module during validation at /repo/packages/web/index.ts');
+  assert.notEqual(api?.hash, web?.hash);
+  assert.equal(similarity(api!, web!), 0);
+  assert.notEqual(fingerprint('TS2307 Cannot resolve /repo/apps/a/shared/index.ts', '', '/repo')?.hash,
+    fingerprint('TS2307 Cannot resolve /repo/apps/b/shared/index.ts', '', '/repo')?.hash);
 });
 
 test('lexical fallback requires high overlap and the same specific diagnostic', () => {
@@ -138,6 +153,70 @@ test('next repeated error moves active to stale; a second independent missed hin
     engine.endTurn('s1', turn);
   }
   assert.equal(await engine.observe(call(1, bad, { turn: 4 }), failure), undefined);
+});
+
+test('feedback uses a four-step window and ignores intervening reads and unrelated attempts', async () => {
+  const { engine, learn, entries } = setup();
+  await learn();
+  const turn = 2;
+  assert.equal((await engine.observe(call(1, bad, { turn }), failure))?.mode, 'post');
+  await engine.observe(call(2, bad, { turn, tool: 'read', recipe: makeRecipe('read', { file_path: 'index.ts' })! }), success);
+  await engine.observe(call(3, 'yarn test', { turn }), { ...failure, diagnostic: 'TS2307 Cannot find dependency in workspace' });
+  await engine.observe(call(5, fixed, { turn }), success);
+  assert.equal(entries()[0]?.confidence, 70);
+  assert.equal(entries()[0]?.state, 'active');
+  await engine.observe(call(1, bad, { turn: 3 }), failure);
+  await engine.observe(call(3, bad, { turn: 3 }), failure);
+  assert.equal(entries()[0]?.state, 'stale');
+  await engine.observe(call(1, bad, { turn: 4 }), failure);
+  await engine.observe(call(6, bad, { turn: 4 }), failure);
+  assert.equal(entries()[0]?.consecutiveMisses, 1);
+});
+
+test('a recommended input failing with a new or unclassifiable error counts as a miss', async () => {
+  const { engine, learn, entries } = setup();
+  await learn();
+  for (const [turn, diagnostic, state] of [[2, 'TS2307 Cannot find dependency in workspace', 'stale'], [3, '', 'archived']] as const) {
+    assert.equal((await engine.observe(call(1, bad, { turn }), failure))?.mode, 'post');
+    await engine.observe(call(3, fixed, { turn }), { ...failure, diagnostic });
+    assert.equal(entries()[0]?.state, state);
+  }
+  assert.equal(entries()[0]?.consecutiveMisses, 2);
+});
+
+test('a replacement fix inherits cross-model failure evidence without inheriting verification counts', async () => {
+  const { engine, learn, entries } = setup();
+  await learn(1, 'remote/cheap');
+  await learn(2, 'remote/cheap');
+  assert.equal(entries()[0]?.scope, 'model_scoped');
+  await learn(3, 'remote/other');
+  const original = entries()[0]!.id;
+  await learn(4, 'remote/cheap', 'yarn test');
+  const replacement = entries()[1]!;
+  assert.equal(replacement.supersedes, original);
+  assert.equal(replacement.verifiedEpisodes, 1);
+  assert.equal(replacement.scope, 'project');
+  assert.deepEqual(replacement.modelEvidence.map(({ model_id }) => model_id), ['remote/cheap', 'remote/other']);
+  await engine.command('p', `pin ${replacement.id}`);
+  assert.equal(engine.before(call(1, bad, { turn: 5, model: 'remote/other' }))?.mode, 'pre');
+});
+
+test('oversized model identifiers stay bounded and long multibyte fixes are preview-only', async () => {
+  const { engine, entries } = setup();
+  const model = `remote/${'m'.repeat(575)}`;
+  const target = `src/${'测试'.repeat(18)}.ts`;
+  const makeCall = (step: number, turn: number, offset: string | number) => call(step, bad, {
+    turn, model, tool: 'read', recipe: makeRecipe('read', { file_path: target, offset })!,
+  });
+  const invalid: Outcome = { kind: 'failure', code: 'INVALID_ARGS', diagnostic: 'invalid arguments: offset must be an integer' };
+  await engine.observe(makeCall(1, 1, '1'), invalid);
+  await engine.observe(makeCall(2, 1, 1), success);
+  assert.equal(entries()[0]?.context.model_id.length, 500);
+  await engine.command('p', `pin ${entries()[0]!.id}`);
+  assert.equal(engine.before(makeCall(1, 2, '1')), undefined);
+  const hint = await engine.observe(makeCall(1, 2, '1'), invalid);
+  assert.match(hint?.text ?? '', /Verified preview:[\s\S]*…[\s\S]*\/sim list/);
+  assert.ok(Buffer.byteLength(`Error: ${wrapHint(hint!.text)}`) <= 100);
 });
 
 test('stale entries are redeemed by a proven fix and a different valid fix supersedes the original', async () => {

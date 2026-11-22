@@ -1,11 +1,14 @@
 import { digest, fingerprint, similarity } from './fingerprint.ts';
 import { COLD_AFTER, isHot, type LedgerStore } from './ledger.ts';
 import { relatedInputs } from './recipes.ts';
+import { HINT_END, HINT_OPEN } from './surface.ts';
 import type { Entry, FailedAttempt, Fingerprint, Hint, Ledger, Outcome, Rationale, Recipe, ToolCall } from './types.ts';
 
 const MAX_STEPS = 4;
 const MAX_TASKS_PER_TURN = 24;
 const MAX_HINTS_PER_TURN = 8;
+const FIELD_LIMIT = 500;
+const HINT_BYTES = 100;
 const NO_CHANGE: Extract<Rationale, { kind: 'verified_retry' }> = { kind: 'verified_retry', text: 'The same input passed after an observed project edit.' };
 const INDEX_KEY = (project: string, directory: string, tool: string, task: string) => JSON.stringify([project, directory, tool, task]);
 const callKey = (call: ToolCall) => INDEX_KEY(call.project, call.directory, call.tool, call.recipe.task);
@@ -17,7 +20,7 @@ interface Track {
   validationOnly: boolean;
 }
 
-interface Offered { entry: Entry; step: number; mode: Hint['mode']; }
+interface Offered { entry: Entry; step: number; }
 interface Turn {
   turn: number;
   model: string;
@@ -34,10 +37,10 @@ function diff(failed: Recipe, fix: Recipe, paths: string[]): Rationale {
     const before = JSON.parse(failed.input) as Record<string, unknown>;
     const after = JSON.parse(fix.input) as Record<string, unknown>;
     const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter((key) => before[key] !== after[key]);
-    const fields = (side: Record<string, unknown>) => keys.map((key) => `${key}=${Object.hasOwn(side, key) ? JSON.stringify(side[key]) : '(omitted)'}`).join(', ');
+    const fields = (side: Record<string, unknown>) => keys.map((key) => `${key}=${Object.hasOwn(side, key) ? JSON.stringify(side[key]) : '(omitted)'}`).join(', ').slice(0, FIELD_LIMIT);
     return { kind: 'input_diff', from: fields(before), to: fields(after) };
   }
-  return { kind: 'input_diff', from: failed.input, to: fix.input };
+  return { kind: 'input_diff', from: failed.input.slice(0, FIELD_LIMIT), to: fix.input.slice(0, FIELD_LIMIT) };
 }
 
 function addEvidence(existing: Entry['modelEvidence'], attempts: FailedAttempt[]): Entry['modelEvidence'] {
@@ -78,24 +81,41 @@ function choose(entries: Entry[], actual: Fingerprint, call: ToolCall): Entry | 
   return best.entry;
 }
 
-function compact(value: string, limit: number): string {
-  return value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+function boundedIdentity(value: string): string {
+  if (value.length <= FIELD_LIMIT) return value;
+  return `${value.slice(0, FIELD_LIMIT - 65)}:${digest(value)}`;
 }
 
-function format(entry: Entry, mode: Hint['mode']): Hint {
+function bytePreview(value: string, budget: number): string {
+  if (Buffer.byteLength(value) <= budget) return value;
+  if (budget < 3) return '';
+  let result = '';
+  let remaining = budget - 3;
+  for (const char of value) {
+    remaining -= Buffer.byteLength(char);
+    if (remaining < 0) break;
+    result += char;
+  }
+  return `${result}…`;
+}
+
+function format(entry: Entry, mode: Hint['mode']): Hint | undefined {
   const latest = entry.failed_attempts.at(-1)!;
   const prior = entry.failed_attempts.find((attempt) => attempt.recipe.key !== entry.verified_fix.recipe.key) ?? latest;
-  const why = entry.rationale.kind === 'verified_retry' ? entry.rationale.paths?.length
-    ? `Passed after editing ${compact(entry.rationale.paths.join(', '), 46)}.` : 'Passed after a project edit; diagnose before retrying.' :
-    entry.verified_fix.recipe.shape === 'arguments' ? `Changed ${compact(entry.rationale.to, 60)}; the retry passed.` :
-    'The revised command passed for this task.';
-  return {
-    id: entry.id,
-    mode,
-    text: `[SIM] 已注入 1 条历史防复发经验 (${mode === 'pre' ? 'before execution' : 'tool failure'})\n` +
-      `Source: ${compact(entry.context.model_id, 42)}. Prior failed input: ${compact(prior.recipe.input, 76)}\n` +
-      `Verified input: ${entry.verified_fix.recipe.input}\nWhy: ${why}\nHistorical evidence; verify for the current task.`,
-  };
+  // Reserve bytes for the tool-result separator, marker and Cordis error prefix.
+  const limit = HINT_BYTES - Buffer.byteLength(HINT_END) - 7;
+  const recipe = entry.verified_fix.recipe.input;
+  const label = entry.rationale.kind === 'verified_retry' ? 'Passed after edit: ' : 'Verified input: ';
+  if (Buffer.byteLength(HINT_OPEN + label + recipe) > limit) {
+    if (mode === 'pre') return undefined;
+    const prefix = `${HINT_OPEN}Verified preview: `;
+    const suffix = '\nFull input: /sim list';
+    return { id: entry.id, mode, text: prefix + bytePreview(recipe, limit - Buffer.byteLength(prefix + suffix)) + suffix };
+  }
+  const budget = limit - Buffer.byteLength(HINT_OPEN + label + recipe);
+  const source = prior.model_id.replace(/\p{C}/gu, '?');
+  const detail = budget >= 14 ? bytePreview(`${source}; failed ${prior.recipe.input}`, budget - 1) + '\n' : '';
+  return { id: entry.id, mode, text: HINT_OPEN + detail + label + recipe };
 }
 
 export class SimEngine {
@@ -121,12 +141,12 @@ export class SimEngine {
   }
 
   recordEdit(call: Omit<ToolCall, 'tool' | 'recipe'>, path?: string): void {
-    const turn = this.turnFor(call);
+    const turn = this.turnFor({ ...call, model: boundedIdentity(call.model) });
     if (!turn?.tasks.size) return;
     const key = JSON.stringify([call.project, call.directory]);
     if (!turn.edits.has(key) && turn.edits.size >= MAX_TASKS_PER_TURN) return;
     const history = turn.edits.get(key) ?? [];
-    turn.edits.set(key, [...history, { step: call.step, path }].slice(-3));
+    turn.edits.set(key, [...history, { step: call.step, path: path?.slice(0, FIELD_LIMIT) }].slice(-3));
   }
 
   private turnFor(call: Pick<ToolCall, 'session' | 'turn' | 'model'>, create = false): Turn | undefined {
@@ -164,13 +184,16 @@ export class SimEngine {
 
   private offer(entry: Entry, turn: Turn, key: string, step: number, mode: Hint['mode']): Hint | undefined {
     if (turn.hintStep === step || turn.used.has(entry.id) || turn.used.size >= MAX_HINTS_PER_TURN) return undefined;
+    const hint = format(entry, mode);
+    if (!hint) return undefined;
     turn.used.add(entry.id);
     turn.hintStep = step;
-    turn.offered.set(key, { entry, step, mode });
-    return format(entry, mode);
+    turn.offered.set(key, { entry, step });
+    return hint;
   }
 
   before(call: ToolCall): Hint | undefined {
+    call = { ...call, model: boundedIdentity(call.model), tool: boundedIdentity(call.tool) };
     const key = callKey(call);
     const matches = this.candidates(key).filter((entry) =>
       entry.state === 'active' && entry.verified_fix.recipe.key !== call.recipe.key && entry.rationale.kind === 'input_diff' &&
@@ -182,19 +205,25 @@ export class SimEngine {
   }
 
   async observe(call: ToolCall, outcome: Outcome): Promise<Hint | undefined> {
-    const actual = outcome.kind === 'failure' ? fingerprint(outcome.diagnostic, outcome.code) : undefined;
+    call = { ...call, model: boundedIdentity(call.model), tool: boundedIdentity(call.tool) };
+    const actual = outcome.kind === 'failure' ? fingerprint(outcome.diagnostic, outcome.code, call.cwd) : undefined;
     const turn = this.turnFor(call, actual !== undefined);
     if (!turn) return undefined;
     const key = callKey(call);
     const track = turn.tasks.get(key);
+    for (const [pendingKey, pending] of turn.offered) {
+      if (call.step - pending.step > MAX_STEPS) turn.offered.delete(pendingKey);
+    }
     const offered = turn.offered.get(key);
+    let credited: string | undefined;
     if (offered && call.step > offered.step) {
-      turn.offered.delete(key);
-      if (call.step === offered.step + 1 && (call.recipe.key === offered.entry.verified_fix.recipe.key ||
-          offered.entry.failed_attempts.some(({ recipe }) => relatedInputs(recipe, call.recipe)))) {
-        const sameError = actual !== undefined && grade(offered.entry, actual) > 0;
-        const usedFix = outcome.kind === 'success' && call.recipe.key === offered.entry.verified_fix.recipe.key;
-        if (sameError || usedFix) await this.recordFeedback(offered.entry.id, sameError);
+      const usedFix = call.recipe.key === offered.entry.verified_fix.recipe.key;
+      const sameError = actual !== undefined && grade(offered.entry, actual) > 0 &&
+        offered.entry.failed_attempts.some(({ recipe }) => relatedInputs(recipe, call.recipe));
+      if (usedFix || sameError) {
+        turn.offered.delete(key);
+        await this.recordFeedback(offered.entry.id, outcome.kind === 'failure');
+        if (outcome.kind === 'success') credited = offered.entry.id;
       }
     }
 
@@ -208,7 +237,7 @@ export class SimEngine {
         const edited = attempts.length > 0 && !track.validationOnly && edits.length > 0;
         if (call.step - track.lastStep <= MAX_STEPS && (changed || edited)) {
           const paths = [...new Set(edits.flatMap(({ path }) => path ? [path] : []))];
-          await this.verify(call, attempts, track.validationOnly, paths);
+          await this.verify(call, attempts, paths, credited);
         }
       }
       return undefined;
@@ -251,7 +280,7 @@ export class SimEngine {
     });
   }
 
-  private async verify(call: ToolCall, attempts: FailedAttempt[], validationOnly: boolean, paths: string[]): Promise<void> {
+  private async verify(call: ToolCall, attempts: FailedAttempt[], paths: string[], credited?: string): Promise<void> {
     const now = this.clock();
     const key = callKey(call);
     const latest = attempts.at(-1)!;
@@ -262,7 +291,7 @@ export class SimEngine {
       const prior = same ?? matches.find((entry) => entry.state !== 'archived') ?? matches.at(-1);
       // Archival needs a fresh verified episode to create a new active record.
       const evidence = addEvidence(prior?.modelEvidence ?? [], attempts);
-      const scope = validationOnly && evidence.length === 1 && ((prior?.verifiedEpisodes ?? 0) + 1 >= 2)
+      const scope = evidence.length === 1 && ((prior?.verifiedEpisodes ?? 0) + 1 >= 2)
         ? 'model_scoped' : 'project';
       if (same) {
         const distinct = new Map([...same.failed_attempts, ...attempts].map((attempt) => [attempt.recipe.key, attempt]));
@@ -270,7 +299,7 @@ export class SimEngine {
         same.modelEvidence = evidence;
         same.scope = scope;
         same.verifiedEpisodes++;
-        boost(same, now);
+        if (same.id !== credited) boost(same, now);
         return true;
       }
       if (prior) prior.state = 'archived';
@@ -281,7 +310,7 @@ export class SimEngine {
         verified_fix: { recipe: call.recipe, model_id: call.model },
         rationale: diff(attempts.find(({ recipe }) => recipe.key === call.recipe.key)?.recipe ?? latest.recipe, call.recipe, paths),
         scope, state: 'active', pinned: false, verifiedEpisodes: 1, confidence: 55,
-        consecutiveMisses: 0, modelEvidence: addEvidence([], attempts), createdAt: now, verifiedAt: now, lastHitAt: null,
+        consecutiveMisses: 0, modelEvidence: evidence, createdAt: now, verifiedAt: now, lastHitAt: null,
         ...(prior ? { supersedes: prior.id } : {}),
       });
       return true;

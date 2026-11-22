@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-commands';
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
-import type { Session } from '@deepseek-ai/dsh-session';
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-working-directory';
 import { homedir } from 'node:os';
@@ -12,7 +12,7 @@ import { SimEngine } from './engine.ts';
 import { JsonLedger } from './ledger.ts';
 import { isInside, Projects } from './project.ts';
 import { isShell, makeRecipe, reusablePath } from './recipes.ts';
-import { PREVENTED, retireHints, wrapHint } from './surface.ts';
+import { containsHint, PREVENTED, retireHints, wrapHint } from './surface.ts';
 import type { Outcome, ToolCall } from './types.ts';
 import type { Project } from './project.ts';
 
@@ -21,7 +21,9 @@ export const name = 'dsh-plugin-sim';
 export const inject = ['tools', 'workingDirectory'];
 
 interface Position { turn: number; step: number; model: string; }
-interface Frame { position: Position; calls: Set<string>; }
+interface Frame { position: Position; calls: Set<string>; hintCall?: string; }
+interface LiveHint { model: string; event: SessionEvent<'tool/result'>; }
+export interface Config { retireHintsOnModelSwitch?: boolean; }
 type Scope = Omit<ToolCall, 'tool' | 'recipe'>;
 const object = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -55,14 +57,14 @@ export function appendHint(content: ContentBlock[], text: string, shell: boolean
 }
 
 /** Cordis adapter for native model tool calls. The core has no SDK dependency. */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: Config = {}): void {
   const home = process.env.DSH_HOME?.trim() || join(homedir(), '.dsh');
   const ledger = new JsonLedger(join(home, 'sim', 'ledger.json'));
   const engine = new SimEngine(ledger);
   const projects = new Projects();
   const frames = new WeakMap<Session, Frame>();
-  const checkedSessions = new WeakSet<Session>();
-  const delivered = new WeakMap<Session, Position>();
+  const retireOnSwitch = config.retireHintsOnModelSwitch === true;
+  const delivered = new WeakMap<Session, LiveHint[]>();
   let lastWarning: number | undefined;
 
   function fault(error: unknown): void {
@@ -80,7 +82,13 @@ export function apply(ctx: Context): void {
   }
 
   function scope(exec: ToolExecution, at: Position, project: Project): Scope {
-    return { ...at, session: exec.agent!.session.id, project: project.project, directory: project.directory };
+    return { ...at, session: exec.agent!.session.id, project: project.project, directory: project.directory, cwd: project.cwd };
+  }
+
+  function markHint(exec: ToolExecution): void {
+    if (!retireOnSwitch) return;
+    const frame = frames.get(exec.agent!.session);
+    if (frame) frame.hintCall = exec.callId;
   }
 
   function projectFor(exec: ToolExecution, actual?: unknown): Promise<Project | undefined> {
@@ -102,24 +110,35 @@ export function apply(ctx: Context): void {
   }
 
   ctx.on('session/event', (session, event) => {
-    if (event.type === 'assistant/message') {
-      const { message, step, turn, interrupted } = event.data;
-      if (interrupted || !message.source.provider || !message.source.model) {
+    try {
+      if (event.type === 'assistant/message') {
+        const { message, step, turn, interrupted } = event.data;
+        if (interrupted || !message.source?.provider || !message.source?.model) {
+          frames.delete(session);
+          return;
+        }
+        frames.set(session, { position: { step, turn, model: `${message.source.provider}/${message.source.model}` }, calls: new Set() });
+      } else if (event.type === 'tool/call') {
+        const frame = frames.get(session);
+        if (frame?.position.turn === event.data.turn && frame.position.step === event.data.step && frame.calls.size < 128) {
+          frame.calls.add(event.data.callId);
+        }
+      } else if (retireOnSwitch && event.type === 'tool/result') {
+        const frame = frames.get(session);
+        if (frame && frame.hintCall === event.data.message.toolCallId && frame.position.turn === event.data.turn &&
+            frame.position.step === event.data.step && containsHint(event.data.message.content)) {
+          delete frame.hintCall;
+          const hints = delivered.get(session) ?? [];
+          hints.push({ model: frame.position.model, event });
+          delivered.set(session, hints);
+        }
+      } else if (event.type === 'turn/end') {
         frames.delete(session);
-        return;
+        engine.endTurn(session.id, event.data.turn);
+      } else if (event.type === 'user/message' && event.data.source?.kind === 'user') {
+        engine.endTurn(session.id);
       }
-      frames.set(session, { position: { step, turn, model: `${message.source.provider}/${message.source.model}` }, calls: new Set() });
-    } else if (event.type === 'tool/call') {
-      const frame = frames.get(session);
-      if (frame?.position.turn === event.data.turn && frame.position.step === event.data.step && frame.calls.size < 128) {
-        frame.calls.add(event.data.callId);
-      }
-    } else if (event.type === 'turn/end') {
-      frames.delete(session);
-      engine.endTurn(session.id, event.data.turn);
-    } else if (event.type === 'user/message' && event.data.source.kind === 'user') {
-      engine.endTurn(session.id);
-    }
+    } catch (error) { fault(error); }
   });
   ctx.on('session/disposed', (session) => {
     frames.delete(session);
@@ -127,20 +146,27 @@ export function apply(ctx: Context): void {
     engine.endTurn(session.id);
   });
 
-  ctx.on('agent/request', async ({ agent, step, turn, signal }, next) => {
-    const config = await next();
-    if (signal.aborted) return config;
-    const session = agent.session;
-    const last = delivered.get(session);
-    if (!last && checkedSessions.has(session)) return config;
-    const keep = last && last.model === `${config.provider}/${config.model}` && last.turn === turn && last.step + 1 === step
-      ? { turn: last.turn, step: last.step } : undefined;
+  if (retireOnSwitch) ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next();
+    if (decision.kind !== 'enter' || payload.signal.aborted) return decision;
+    const session = payload.agent.session;
+    const hints = delivered.get(session);
+    if (!hints?.length) return decision;
+    // Newer Harness payloads include the route captured for this exact step.
+    const route = object(object(payload)?.modelSelection);
+    if (typeof route?.provider !== 'string' || typeof route.model !== 'string') {
+      delivered.delete(session);
+      return decision;
+    }
+    const model = `${route.provider}/${route.model}`;
+    const retire = hints.filter((hint) => hint.model !== model);
+    if (!retire.length) return decision;
     try {
-      if (!retireHints(session, keep)) delivered.delete(session);
-      checkedSessions.add(session);
+      retireHints(session, retire.map(({ event }) => event));
+      delivered.set(session, hints.filter((hint) => hint.model === model));
     } catch (error) { fault(error); }
-    return config;
-  }, { prepend: true });
+    return decision;
+  });
 
   // Pre-execute is where the proposed arguments actually exist. The gate only
   // denies positively matched known retries; it never rewrites tool arguments.
@@ -162,7 +188,7 @@ export function apply(ctx: Context): void {
         if (!recipe) continue;
         const hint = engine.before({ ...scope(exec, at, project), tool: exec.name, recipe });
         if (hint) {
-          delivered.set(exec.agent!.session, at);
+          markHint(exec);
           return { kind: 'deny', reason: wrapHint(hint.text), info: { name: 'SimRetryNotice', code: PREVENTED } };
         }
       }
@@ -192,7 +218,7 @@ export function apply(ctx: Context): void {
         if (!recipe || position(exec) !== at) continue;
         const hint = await engine.observe({ ...scope(exec, at, project), tool: exec.name, recipe }, outcome);
         if (hint && position(exec) === at) {
-          delivered.set(exec.agent!.session, at);
+          markHint(exec);
           return { ...decision, content: appendHint(decision.content ?? result.content, wrapHint(hint.text), shell) };
         }
       }

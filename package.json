@@ -1,8 +1,11 @@
 {
   "name": "dsh-plugin-sim",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local failure-to-fix memory for DeepSeek Harness",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/EasonMWS/dsh-sim.git" },
+  "homepage": "https://github.com/EasonMWS/dsh-sim#readme",
+  "bugs": "https://github.com/EasonMWS/dsh-sim/issues",
   "type": "module",
   "engines": { "node": ">=22.18", "dsh": "0.2.1-rc.3 || 0.2.2-rc.5 || >=0.2.1 <0.3.0" },
   "exports": {
@@ -19,6 +22,8 @@
     "test:integration": "npm run build && node --test test/harness.integration.ts",
     "prepack": "npm run build"
   },
+  "peerDependencies": { "@deepseek-ai/cordis": ">=4.0.5 <5" },
+  "peerDependenciesMeta": { "@deepseek-ai/cordis": { "optional": true } },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
     "@deepseek-ai/dsh-agent": "0.2.1-rc.3",

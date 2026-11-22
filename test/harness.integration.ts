@@ -12,7 +12,7 @@ const resolveSdk = process.env.SIM_DSH_NODE_MODULES
   : createRequire(import.meta.url);
 const sdk = (name: string) => import(pathToFileURL(resolveSdk.resolve(`@deepseek-ai/${name}`)).href);
 
-test('real Cordis tool waterfall, session replay and slash registry exercise a complete recurrence', async (t) => {
+for (const retireHintsOnModelSwitch of [false, true]) test(`real Cordis recurrence with route retirement ${retireHintsOnModelSwitch ? 'enabled' : 'disabled'}`, async (t) => {
   const [{ Context }, { SystemPrompt }, { ToolRuntime, defineTool }, { SessionStore }, { CommandRuntime },
     { createAssistantMessage, createToolResultMessage }, { scopeTarget }] = await Promise.all([
     sdk('cordis'), sdk('dsh-system-prompt'), sdk('dsh-tools'), sdk('dsh-session'), sdk('dsh-commands'), sdk('dsh-llm'), sdk('dsh-scope'),
@@ -35,7 +35,7 @@ test('real Cordis tool waterfall, session replay and slash registry exercise a c
   await ctx.plugin(SessionStore);
   await ctx.plugin(CommandRuntime);
   await ctx.plugin({ apply(local) { local.provide('workingDirectory', { get: () => cwd }); } });
-  const installed = ctx.plugin(sim);
+  const installed = ctx.plugin(sim, { retireHintsOnModelSwitch });
   await installed;
   const session = ctx.sessions.create('sim-fixture', { meta: { cwd } });
   const agent = { session, ctx };
@@ -55,8 +55,10 @@ test('real Cordis tool waterfall, session replay and slash registry exercise a c
   }));
 
   const slash = (line: string) => ctx.commands.execute(agent, line, [], signal);
-  const route = (turn: number, step: number, model: string) => ctx.waterfall(scopeTarget(agent, agent), 'agent/request',
-    { agent, step, turn, signal }, async () => ({ provider: 'fixture', model }));
+  const capturedSelection = Boolean(batchExecutor);
+  const route = (turn: number, step: number, model: string) => ctx.waterfall(scopeTarget(agent, agent), 'agent/pre-step',
+    { agent, step, turn, signal, messages: [], ...(capturedSelection ? { modelSelection: { provider: 'fixture', model } } : {}) },
+    async () => ({ kind: 'enter', messages: [] }));
   const execute = async (turn: number, step: number, model: string, command: string) => {
     await route(turn, step, model);
     session.append('step/start', { step, turn });
@@ -102,8 +104,17 @@ test('real Cordis tool waterfall, session replay and slash registry exercise a c
   assert.match(hit.content[0].text, /Verified input: pnpm test[\s\S]*\[exit code: 1]$/);
   await route(2, 2, 'strong');
   assert.match(history(), /Verified input: pnpm test/);
-  await route(2, 2, 'stronger');
-  assert.doesNotMatch(history(), /Verified input:|\[SIM]/);
+  const beforeSwitch = [...session.surface.nodes];
+  await route(2, 4, 'strong');
+  assert.deepEqual(session.surface.nodes, beforeSwitch);
+  await route(2, 4, 'stronger');
+  if (retireHintsOnModelSwitch && capturedSelection) {
+    assert.doesNotMatch(history(), /Verified input:|\[SIM]/);
+    assert.notDeepEqual(session.surface.nodes, beforeSwitch);
+  } else {
+    assert.match(history(), /Verified input: pnpm test/);
+    assert.deepEqual(session.surface.nodes, beforeSwitch);
+  }
   assert.match(history(), /ERR_PNPM_USAGE[\s\S]*\[exit code: 1]/);
   end(2);
 
@@ -115,12 +126,15 @@ test('real Cordis tool waterfall, session replay and slash registry exercise a c
   await execute(3, 2, 'cheap', 'pnpm test');
   assert.match(history(), /\[SIM]/);
   await route(3, 3, 'cheap');
-  assert.doesNotMatch(history(), /\[SIM]/);
-  assert.match(history(), /Error: tool call skipped before execution/);
+  assert.match(history(), /\[SIM]/);
+  await route(3, 4, 'stronger');
+  if (retireHintsOnModelSwitch && capturedSelection) {
+    assert.doesNotMatch(history(), /\[SIM]/);
+    assert.match(history(), /Error: tool call skipped before execution/);
+  } else assert.match(history(), /\[SIM]/);
   end(3);
   assert.equal((await slash(`/sim drop ${stored.entries[0].id}`)).result.kind, 'success');
 
   await installed.dispose();
   assert.equal((await slash('/sim status')), undefined);
-  assert.doesNotMatch(history(), /\[SIM]/);
 });

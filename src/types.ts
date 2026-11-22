@@ -1,4 +1,4 @@
-export type Fingerprint = { hash: string; terms: string[]; signals: string[] };
+export type Fingerprint = { hash: string; terms: string[]; signals: string[]; paths?: string[] };
 
 export interface Recipe {
   /** Exact usable input, with presentation-only fields stripped. */
@@ -58,6 +58,8 @@ export interface ToolCall {
   directory: string;
   tool: string;
   recipe: Recipe;
+  /** Absolute tool working directory used only for diagnostic normalization. */
+  cwd?: string;
 }
 
 export type Outcome =
